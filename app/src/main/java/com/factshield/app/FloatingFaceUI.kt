@@ -33,7 +33,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.content.Intent
+import android.net.Uri
 import android.util.Log
+import androidx.compose.foundation.border
+import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.delay
 import kotlin.math.*
 
@@ -422,6 +426,7 @@ private fun DrawScope.drawRedFace(cx: Float, cy: Float, r: Float, pulseScale: Fl
 
 @Composable
 fun FactPopupCard(result: FactCheckResult, onDismiss: () -> Unit) {
+    val context = LocalContext.current
     val (bgColor, statusLabel) = when (result.status) {
         FactStatus.GREEN  -> Pair(Color(0xFF064E3B), "LIKELY RELIABLE")
         FactStatus.YELLOW -> Pair(Color(0xFF451A03), "NEEDS VERIFICATION")
@@ -484,7 +489,7 @@ fun FactPopupCard(result: FactCheckResult, onDismiss: () -> Unit) {
             if (result.sources.isNotEmpty()) {
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    text = "SOURCES:", color = Color(0xFF64748B),
+                    text = "SOURCES (tap to open):", color = Color(0xFF64748B),
                     fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp
                 )
                 Spacer(Modifier.height(4.dp))
@@ -497,11 +502,35 @@ fun FactPopupCard(result: FactCheckResult, onDismiss: () -> Unit) {
                             modifier = Modifier
                                 .weight(1f, fill = false)
                                 .clip(RoundedCornerShape(8.dp))
+                                .border(
+                                    width = 0.5.dp,
+                                    color = Color(0xFF38BDF8).copy(alpha = 0.4f),
+                                    shape = RoundedCornerShape(8.dp)
+                                )
                                 .background(Color(0xFF1E293B))
+                                .clickable {
+                                    var url = source.url.trim()
+                                    if (url.isNotBlank()) {
+                                        if (!url.startsWith("http://", ignoreCase = true) &&
+                                            !url.startsWith("https://", ignoreCase = true)
+                                        ) {
+                                            url = "https://$url"
+                                        }
+                                        try {
+                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                            context.startActivity(intent)
+                                            onDismiss()
+                                        } catch (e: Exception) {
+                                            Log.e("FloatingFaceUI", "Failed to open link: $url", e)
+                                        }
+                                    }
+                                }
                                 .padding(horizontal = 8.dp, vertical = 5.dp)
                         ) {
                             Text(
-                                text = "\uD83C\uDF10 $source",
+                                text = "🌐 ${source.name}",
                                 color = Color(0xFF38BDF8),
                                 fontSize = 10.sp, fontWeight = FontWeight.Bold,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis

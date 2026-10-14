@@ -23,12 +23,23 @@ import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlinx.coroutines.*
 
-private const val TAG = "XFactService"
-private const val TARGET_PKG = "com.twitter.android"
-private const val SCROLL_DEBOUNCE_MS    = 2200L   // wait 2.2s after scrolling stops
-private const val SCROLL_ABORT_EVENTS   = 5        // events during loading = user scrolled away
-private const val PREFS_NAME = "factshield_prefs"
-private const val KEY_DEMO_MODE = "demo_everywhere"
+private const val TAG              = "XFactService"
+private const val TARGET_PKG       = "com.twitter.android"
+
+/**
+ * How long to wait after the last scroll event before triggering analysis.
+ * 1.8s feels snappy; 2.2s was too slow.
+ */
+private const val SCROLL_DEBOUNCE_MS   = 1800L
+
+/**
+ * Number of scroll events while SCANNING that indicate the user has moved on.
+ * Reduced from 5 → 2: any intentional scroll away fires just 2+ events.
+ */
+private const val SCROLL_ABORT_EVENTS  = 2
+
+private const val PREFS_NAME      = "factshield_prefs"
+private const val KEY_DEMO_MODE   = "demo_everywhere"
 
 class XFactAccessibilityService : AccessibilityService() {
 
@@ -39,15 +50,15 @@ class XFactAccessibilityService : AccessibilityService() {
     private var overlayAttached = false
 
     // ── State (driven into Compose via mutableState) ─────────
-    private var ballState = mutableStateOf(BallState.IDLE)
+    private var ballState  = mutableStateOf(BallState.IDLE)
     private var factResult = mutableStateOf<FactCheckResult?>(null)
 
     // ── Coroutine scope ──────────────────────────────────────
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // ── Scroll debounce ──────────────────────────────────────
-    private val handler = Handler(Looper.getMainLooper())
-    private var scrollDebounceJob: Runnable? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var scrollDebounceRunnable: Runnable? = null
 
     // ── Active analysis job (cancellable) ────────────────────
     private var analysisJob: Job? = null
@@ -87,57 +98,76 @@ class XFactAccessibilityService : AccessibilityService() {
         event ?: return
         val pkg = event.packageName?.toString() ?: return
 
-        // Ignore our own overlay events
+        // Never react to our own overlay events
         if (pkg == applicationContext.packageName) return
 
         when (event.eventType) {
+
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                // Ignore transient system packages that fire while the user is still in X
-                // (status bar, keyboard, edge effects, etc.) to prevent the overlay from
-                // being hidden mid-scroll.
+                // Ignore transient system packages (SystemUI, keyboards, edge panels) that fire
+                // while the user is still in X — they must not hide the overlay.
                 if (isTransientSystemPackage(pkg)) return
                 currentPackage = pkg
                 updateOverlayVisibility(pkg)
             }
+
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
-                // Restore visibility if overlay was accidentally hidden while X is foreground
-                val activeVisible = overlayAttached && shouldBeVisible(currentPackage)
-                if (activeVisible && overlayView.visibility != android.view.View.VISIBLE) {
-                    Handler(Looper.getMainLooper()).post {
-                        overlayView.visibility = android.view.View.VISIBLE
-                    }
+                // Restore overlay visibility if it was accidentally hidden while X is foreground
+                if (overlayAttached && shouldBeVisible(currentPackage)
+                    && overlayView.visibility != View.VISIBLE) {
+                    mainHandler.post { overlayView.visibility = View.VISIBLE }
                 }
-                if (!shouldBeVisible(pkg) && !shouldBeVisible(currentPackage)) return
-                if (ballState.value == BallState.SCANNING) {
-                    // User scrolled WHILE loading — count events to detect scroll-away
-                    scrollEventsDuringLoad++
-                    if (scrollEventsDuringLoad >= SCROLL_ABORT_EVENTS) {
-                        abortAnalysis()
+
+                // Only act on scroll events when X (or demo mode) is in the foreground
+                if (!shouldBeVisible(currentPackage)) return
+
+                when {
+                    // ── User is actively loading: each scroll event counts toward abort ──
+                    ballState.value == BallState.SCANNING -> {
+                        scrollEventsDuringLoad++
+                        if (scrollEventsDuringLoad >= SCROLL_ABORT_EVENTS) {
+                            abortAndGoIdle()
+                        }
                     }
-                } else {
-                    triggerScrollDebounce()
+
+                    // ── Result is displayed: clear it immediately so stale result isn't shown
+                    //    on the next post. Go IDLE now, then schedule fresh analysis.
+                    ballState.value != BallState.IDLE -> {
+                        mainHandler.post {
+                            factResult.value = null
+                            ballState.value = BallState.IDLE
+                        }
+                        rescheduleScrollDebounce()
+                    }
+
+                    // ── Already IDLE: just schedule analysis after scroll settles ──
+                    else -> {
+                        rescheduleScrollDebounce()
+                    }
                 }
             }
+
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                // no-op for now; scroll debounce handles analysis
+                // no-op: scroll debounce handles analysis triggering
             }
         }
     }
 
     /**
-     * Returns true for packages that produce transient WINDOW_STATE_CHANGED events
-     * while the user is actually still viewing X — system UI, keyboards, edge effects, etc.
-     * These must NOT trigger the visibility check so the overlay doesn't disappear.
+     * Returns true for packages that emit WINDOW_STATE_CHANGED while the user
+     * is actively inside X — these must not trigger the hide logic.
      */
     private fun isTransientSystemPackage(pkg: String): Boolean {
-        return pkg == "com.android.systemui" ||
-               pkg == "android" ||
-               pkg == "com.android.launcher3" ||
-               pkg == "com.google.android.inputmethod.latin" ||
-               pkg == "com.samsung.android.honeyboard" ||
-               pkg == "com.swiftkey.swiftkeyapp" ||
-               pkg.endsWith(".inputmethod") ||
-               pkg.endsWith(".keyboard")
+        if (pkg == "com.android.systemui") return true
+        if (pkg == "android")              return true
+        if (pkg == "com.android.launcher3") return true
+        if (pkg.endsWith(".inputmethod"))  return true
+        if (pkg.endsWith(".keyboard"))     return true
+        // Common keyboard packages
+        if (pkg == "com.google.android.inputmethod.latin") return true
+        if (pkg == "com.samsung.android.honeyboard")       return true
+        if (pkg == "com.swiftkey.swiftkeyapp")             return true
+        return false
     }
 
     override fun onInterrupt() {
@@ -158,13 +188,13 @@ class XFactAccessibilityService : AccessibilityService() {
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
 
             setContent {
-                val state by ballState
+                val state  by ballState
                 val result by factResult
 
                 FactShieldOverlay(
-                    state = state,
-                    result = result,
-                    onTap = { triggerManualAnalysis() },
+                    state      = state,
+                    result     = result,
+                    onTap      = { triggerManualAnalysis() },
                     onLongPress = { triggerManualAnalysis() }
                 )
             }
@@ -188,7 +218,7 @@ class XFactAccessibilityService : AccessibilityService() {
         overlayAttached = true
         lifecycleOwner.onResume()
 
-        // Initially hidden until we detect X is in foreground
+        // Initially hidden until X is detected in foreground
         overlayView.visibility = View.GONE
     }
 
@@ -212,10 +242,13 @@ class XFactAccessibilityService : AccessibilityService() {
     private fun updateOverlayVisibility(pkg: String) {
         if (!overlayAttached) return
         val visible = shouldBeVisible(pkg)
-        Handler(Looper.getMainLooper()).post {
+        mainHandler.post {
             overlayView.visibility = if (visible) View.VISIBLE else View.GONE
             if (!visible) {
-                ballState.value = BallState.IDLE
+                // Cancel any pending work when leaving X
+                cancelScrollDebounce()
+                analysisJob?.cancel()
+                ballState.value  = BallState.IDLE
                 factResult.value = null
             }
         }
@@ -225,25 +258,37 @@ class XFactAccessibilityService : AccessibilityService() {
     //  Scroll Debounce → Auto Trigger
     // ────────────────────────────────────────────────────────
 
-    private fun triggerScrollDebounce() {
-        scrollDebounceJob?.let { handler.removeCallbacks(it) }
-        scrollDebounceJob = Runnable {
+    /**
+     * Cancel the previous debounce runnable and post a new one.
+     * Only runs when the ball is in a non-scanning terminal state (IDLE / result shown).
+     */
+    private fun rescheduleScrollDebounce() {
+        cancelScrollDebounce()
+        scrollDebounceRunnable = Runnable {
             val s = ballState.value
-            if (s == BallState.IDLE || s == BallState.GREEN
-                || s == BallState.YELLOW || s == BallState.RED) {
+            // Do not auto-trigger if somehow SCANNING already (race guard)
+            if (s != BallState.SCANNING) {
                 triggerManualAnalysis()
             }
         }
-        handler.postDelayed(scrollDebounceJob!!, SCROLL_DEBOUNCE_MS)
+        mainHandler.postDelayed(scrollDebounceRunnable!!, SCROLL_DEBOUNCE_MS)
     }
 
-    /** Cancel active analysis and return to IDLE (user scrolled away). */
-    private fun abortAnalysis() {
-        scrollDebounceJob?.let { handler.removeCallbacks(it) }
+    private fun cancelScrollDebounce() {
+        scrollDebounceRunnable?.let { mainHandler.removeCallbacks(it) }
+        scrollDebounceRunnable = null
+    }
+
+    /**
+     * User scrolled away mid-analysis → cancel everything, go IDLE immediately.
+     * The next scroll-stop will re-trigger analysis for the new post.
+     */
+    private fun abortAndGoIdle() {
+        cancelScrollDebounce()
         analysisJob?.cancel()
         analysisJob = null
         scrollEventsDuringLoad = 0
-        ballState.value = BallState.IDLE
+        mainHandler.post { ballState.value = BallState.IDLE }
         Log.d(TAG, "Analysis aborted — user scrolled away")
     }
 
@@ -252,7 +297,12 @@ class XFactAccessibilityService : AccessibilityService() {
     // ────────────────────────────────────────────────────────
 
     fun triggerManualAnalysis() {
+        // Ignore if already scanning
         if (ballState.value == BallState.SCANNING) return
+
+        // Cancel any pending debounce so we don't double-trigger
+        cancelScrollDebounce()
+
         ballState.value = BallState.SCANNING
         scrollEventsDuringLoad = 0
 
@@ -261,17 +311,17 @@ class XFactAccessibilityService : AccessibilityService() {
                 // 1. Scrape tweet text from accessibility tree
                 val tweetText = withContext(Dispatchers.Default) { scrapeTweetText() }
 
-                // 2. Take screenshot (API 30+), graceful fallback if unavailable
+                // 2. Take screenshot (API 30+)
                 val screenshot = withContext(Dispatchers.IO) { captureScreenshot() }
 
-                // Check if still relevant (user might have scrolled away)
-                if (!isActive) return@launch
+                // 3. Abort early if the user scrolled away while we were collecting data
+                if (!isActive || ballState.value != BallState.SCANNING) return@launch
 
-                // 3. Call Groq (text + vision)
+                // 4. Call Groq (text-first; vision if image-only)
                 val result = FactCheckRepository.analyze(tweetText, screenshot)
 
-                // 4. Update UI only if still scanning (not aborted)
-                if (ballState.value == BallState.SCANNING) {
+                // 5. Update UI only if still scanning (not aborted by scroll)
+                if (isActive && ballState.value == BallState.SCANNING) {
                     factResult.value = result
                     ballState.value = when (result.status) {
                         FactStatus.GREEN  -> BallState.GREEN
@@ -280,18 +330,19 @@ class XFactAccessibilityService : AccessibilityService() {
                     }
                 }
             } catch (e: CancellationException) {
-                // Normal — user scrolled away; already set to IDLE in abortAnalysis()
-                Log.d(TAG, "Analysis job cancelled")
+                // Normal — user scrolled away; abortAndGoIdle already set IDLE
+                Log.d(TAG, "Analysis job cancelled (user scrolled away)")
             } catch (e: Exception) {
-                if (ballState.value == BallState.SCANNING) {
-                    Log.e(TAG, "Analysis failed: ${e.message}", e)
-                    ballState.value = BallState.YELLOW
+                Log.e(TAG, "Analysis pipeline exception: ${e.message}", e)
+                if (isActive && ballState.value == BallState.SCANNING) {
+                    // Show a YELLOW result instead of a bare "Analysis failed" toast
                     factResult.value = FactCheckResult(
-                        status = FactStatus.YELLOW,
-                        confidence = 0,
-                        shortVerdict = "Analysis failed. Check your connection.",
-                        sources = listOf("FactShield")
+                        status       = FactStatus.YELLOW,
+                        confidence   = 0,
+                        shortVerdict = "Could not complete analysis. Tap to retry.",
+                        sources      = emptyList()
                     )
+                    ballState.value = BallState.YELLOW
                 }
             } finally {
                 scrollEventsDuringLoad = 0
@@ -303,21 +354,47 @@ class XFactAccessibilityService : AccessibilityService() {
     //  AccessibilityNodeInfo Text Scraper
     // ────────────────────────────────────────────────────────
 
+    /**
+     * Scrapes the SINGLE best tweet text from the accessibility tree.
+     *
+     * Strategy: collect all text nodes, then return the LONGEST single item
+     * that looks like tweet content (40–600 chars). Joining multiple nodes
+     * was causing previous-post text to contaminate current-post analysis
+     * because the accessibility tree contains ALL visible posts simultaneously.
+     */
     private fun scrapeTweetText(): String {
         val root = rootInActiveWindow ?: return ""
-        val collected = mutableListOf<String>()
-        collectText(root, collected)
+        val raw  = mutableListOf<String>()
+        collectTweetText(root, raw)
 
-        // Filter short noise (buttons, timestamps, handles) — keep >= 25 chars
-        return collected
-            .filter { it.length >= 25 }
-            .distinct()
-            .take(5)
-            .joinToString(" | ")
-            .take(1500) // stay within token budget
+        // Pick the single longest text block in the "tweet body" length range.
+        // UI labels (Reply, Retweet, Like, usernames) are short; pane descriptions are very long.
+        // The main tweet body is almost always the longest item in 40–600 chars range.
+        val best = raw
+            .filter { it.length in 40..600 }
+            .distinctBy { it.trim().lowercase() }
+            .maxByOrNull { it.length }          // longest = most likely to be tweet body
+
+        if (best != null) {
+            Log.d(TAG, "scrapeTweetText: best=${best.take(80)}")
+            return best.take(1000)
+        }
+
+        // Fallback: if nothing in ideal range, take anything >= 15 chars, longest first
+        return raw
+            .filter { it.length >= 15 }
+            .distinctBy { it.trim().lowercase() }
+            .maxByOrNull { it.length }
+            ?.take(1000) ?: ""
     }
 
-    private fun collectText(node: AccessibilityNodeInfo, out: MutableList<String>) {
+    /**
+     * Recursively walks the accessibility tree and collects meaningful text.
+     * Stops early if we have enough raw candidates for speed.
+     */
+    private fun collectTweetText(node: AccessibilityNodeInfo, out: MutableList<String>) {
+        if (out.size >= 12) return // enough candidates — stop traversing
+
         val text = node.text?.toString()?.trim()
         if (!text.isNullOrBlank()) out.add(text)
 
@@ -326,7 +403,8 @@ class XFactAccessibilityService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            collectText(child, out)
+            collectTweetText(child, out)
+            child.recycle()  // recycle child nodes to avoid memory leaks
         }
     }
 
@@ -346,6 +424,7 @@ class XFactAccessibilityService : AccessibilityService() {
                             try {
                                 val hardwareBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, null)
                                 val softBitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                                hardwareBitmap?.recycle()
                                 hardwareBuffer.close()
                                 cont.resume(softBitmap)
                             } catch (e: Exception) {
@@ -356,7 +435,7 @@ class XFactAccessibilityService : AccessibilityService() {
                         }
 
                         override fun onFailure(errorCode: Int) {
-                            Log.w(TAG, "Screenshot failed, errorCode=$errorCode — degrading to text-only")
+                            Log.w(TAG, "Screenshot failed, errorCode=$errorCode — text-only mode")
                             cont.resume(null)
                         }
                     }
@@ -372,7 +451,6 @@ class XFactAccessibilityService : AccessibilityService() {
     //  Utility
     // ────────────────────────────────────────────────────────
 
-    private fun dpToPx(dp: Int): Int {
-        return (dp * resources.displayMetrics.density).toInt()
-    }
+    private fun dpToPx(dp: Int): Int =
+        (dp * resources.displayMetrics.density).toInt()
 }
