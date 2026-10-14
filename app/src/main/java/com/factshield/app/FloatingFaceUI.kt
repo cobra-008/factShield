@@ -66,6 +66,7 @@ fun FactShieldOverlay(
     state: BallState,
     result: FactCheckResult?,
     onTap: () -> Unit,
+    onDoubleTap: () -> Unit,
     onLongPress: () -> Unit
 ) {
     var showPopup by remember { mutableStateOf(false) }
@@ -89,6 +90,11 @@ fun FactShieldOverlay(
                 .clip(CircleShape)
                 .pointerInput(state) {
                     detectTapGestures(
+                        onDoubleTap = {
+                            // Double-tap: hard reset + fresh re-scrape + re-analyze
+                            showPopup = false
+                            onDoubleTap()
+                        },
                         onTap = {
                             when (state) {
                                 BallState.IDLE, BallState.SCANNING -> onTap()

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -192,9 +193,10 @@ class XFactAccessibilityService : AccessibilityService() {
                 val result by factResult
 
                 FactShieldOverlay(
-                    state      = state,
-                    result     = result,
-                    onTap      = { triggerManualAnalysis() },
+                    state       = state,
+                    result      = result,
+                    onTap       = { triggerManualAnalysis() },
+                    onDoubleTap = { resetAndReanalyze() },
                     onLongPress = { triggerManualAnalysis() }
                 )
             }
@@ -350,62 +352,135 @@ class XFactAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Double-tap reset: cancel everything, wipe the result, reset to IDLE,
+     * then immediately kick off a fresh analysis cycle (re-scrape + re-call Groq).
+     */
+    private fun resetAndReanalyze() {
+        Log.d(TAG, "resetAndReanalyze: hard reset triggered by double-tap")
+        cancelScrollDebounce()
+        analysisJob?.cancel()
+        analysisJob = null
+        scrollEventsDuringLoad = 0
+        mainHandler.post {
+            factResult.value = null
+            ballState.value  = BallState.IDLE
+        }
+        // Small delay so state resets visually before scanning starts
+        mainHandler.postDelayed({ triggerManualAnalysis() }, 120)
+    }
+
     // ────────────────────────────────────────────────────────
     //  AccessibilityNodeInfo Text Scraper
     // ────────────────────────────────────────────────────────
 
     /**
+     * Candidate tweet text with the vertical center of its node in screen coordinates.
+     */
+    private data class TextCandidate(val text: String, val centerY: Int)
+
+    /**
      * Scrapes the SINGLE best tweet text from the accessibility tree.
      *
-     * Strategy: collect all text nodes, then return the LONGEST single item
-     * that looks like tweet content (40–600 chars). Joining multiple nodes
-     * was causing previous-post text to contaminate current-post analysis
-     * because the accessibility tree contains ALL visible posts simultaneously.
+     * Strategy:
+     * 1. Walk the tree collecting (text, centerY) pairs for each text node.
+     * 2. Filter to the CENTER CROP ZONE — the middle 52% of the screen height
+     *    (from 24% to 76%). This discards text from the previous post (at top)
+     *    and the next post (at bottom) that Twitter's accessibility tree exposes
+     *    even when those posts are not the one the user is reading.
+     * 3. Among the surviving candidates, prefer the one whose center is closest
+     *    to the screen vertical center — that is the frontmost visible post.
+     * 4. Length filter (35–900 chars) to skip UI chrome, usernames, labels.
      */
     private fun scrapeTweetText(): String {
         val root = rootInActiveWindow ?: return ""
-        val raw  = mutableListOf<String>()
-        collectTweetText(root, raw)
 
-        // Pick the single longest text block in the "tweet body" length range.
-        // UI labels (Reply, Retweet, Like, usernames) are short; pane descriptions are very long.
-        // The main tweet body is almost always the longest item in 40–600 chars range.
-        val best = raw
-            .filter { it.length in 40..600 }
-            .distinctBy { it.trim().lowercase() }
-            .maxByOrNull { it.length }          // longest = most likely to be tweet body
+        // Get physical screen height for the crop zone
+        val screenHeight = resources.displayMetrics.heightPixels.takeIf { it > 0 } ?: 2400
+        val cropTop      = (screenHeight * 0.24).toInt()   // 24% from top
+        val cropBottom   = (screenHeight * 0.76).toInt()   // 24% from bottom
+        val screenCenterY = screenHeight / 2
 
-        if (best != null) {
-            Log.d(TAG, "scrapeTweetText: best=${best.take(80)}")
-            return best.take(1000)
+        val candidates = mutableListOf<TextCandidate>()
+        collectTweetCandidates(root, candidates)
+
+        Log.d(TAG, "scrapeTweetText: ${candidates.size} raw candidates, " +
+                   "screenH=$screenHeight crop=[$cropTop..$cropBottom]")
+
+        // Step 1 — filter by center-crop zone AND tweet-body length
+        val inZone = candidates
+            .filter { it.centerY in cropTop..cropBottom && it.text.length in 35..900 }
+            .distinctBy { it.text.trim().lowercase() }
+
+        Log.d(TAG, "scrapeTweetText: ${inZone.size} in center zone")
+
+        if (inZone.isNotEmpty()) {
+            // Step 2 — pick closest to screen center (the frontmost post)
+            val best = inZone.minByOrNull { Math.abs(it.centerY - screenCenterY) }!!
+            Log.d(TAG, "scrapeTweetText: best centerY=${best.centerY} text=${best.text.take(80)}")
+            return best.text.take(1000)
         }
 
-        // Fallback: if nothing in ideal range, take anything >= 15 chars, longest first
-        return raw
-            .filter { it.length >= 15 }
-            .distinctBy { it.trim().lowercase() }
-            .maxByOrNull { it.length }
-            ?.take(1000) ?: ""
+        // Fallback A — relax to any in-zone text >= 15 chars
+        val fallbackZone = candidates
+            .filter { it.centerY in cropTop..cropBottom && it.text.length >= 15 }
+            .distinctBy { it.text.trim().lowercase() }
+        if (fallbackZone.isNotEmpty()) {
+            val best = fallbackZone.minByOrNull { Math.abs(it.centerY - screenCenterY) }!!
+            Log.d(TAG, "scrapeTweetText: fallback-zone best=${best.text.take(80)}")
+            return best.text.take(1000)
+        }
+
+        // Fallback B — whole screen, longest in 35–900 (original behaviour)
+        val fallbackGlobal = candidates
+            .filter { it.text.length in 35..900 }
+            .distinctBy { it.text.trim().lowercase() }
+            .maxByOrNull { it.text.length }
+        if (fallbackGlobal != null) {
+            Log.d(TAG, "scrapeTweetText: global fallback=${fallbackGlobal.text.take(80)}")
+            return fallbackGlobal.text.take(1000)
+        }
+
+        return ""
     }
 
     /**
-     * Recursively walks the accessibility tree and collects meaningful text.
-     * Stops early if we have enough raw candidates for speed.
+     * Recursively walks the accessibility tree collecting (text, centerY) pairs.
+     * Uses getBoundsInScreen() so we know where on screen each node actually sits.
+     * Stops early once 20 candidates are collected to keep traversal fast.
      */
-    private fun collectTweetText(node: AccessibilityNodeInfo, out: MutableList<String>) {
-        if (out.size >= 12) return // enough candidates — stop traversing
+    private fun collectTweetCandidates(
+        node: AccessibilityNodeInfo,
+        out: MutableList<TextCandidate>
+    ) {
+        if (out.size >= 20) return  // enough candidates — stop early
+
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        val centerY = (bounds.top + bounds.bottom) / 2
 
         val text = node.text?.toString()?.trim()
-        if (!text.isNullOrBlank()) out.add(text)
+        if (!text.isNullOrBlank()) out.add(TextCandidate(text, centerY))
 
         val desc = node.contentDescription?.toString()?.trim()
-        if (!desc.isNullOrBlank() && desc != text) out.add(desc)
+        if (!desc.isNullOrBlank() && desc != text) out.add(TextCandidate(desc, centerY))
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            collectTweetText(child, out)
-            child.recycle()  // recycle child nodes to avoid memory leaks
+            collectTweetCandidates(child, out)
+            child.recycle()
         }
+    }
+
+    /**
+     * Kept for any call-sites that may reference it directly.
+     * Delegates to the new bounds-aware implementation.
+     */
+    @Suppress("unused")
+    private fun collectTweetText(node: AccessibilityNodeInfo, out: MutableList<String>) {
+        val candidates = mutableListOf<TextCandidate>()
+        collectTweetCandidates(node, candidates)
+        candidates.forEach { out.add(it.text) }
     }
 
     // ────────────────────────────────────────────────────────
