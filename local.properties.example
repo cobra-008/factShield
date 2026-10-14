@@ -1,0 +1,4 @@
+## Example local.properties for FactShield
+## Copy this file to local.properties and fill in your values.
+sdk.dir=/path/to/your/android/sdk
+GROQ_API_KEY=your_groq_api_key_here

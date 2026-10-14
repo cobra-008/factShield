@@ -1,0 +1,58 @@
+Created At: 2026-10-14T12:31:27+05:30
+Completed At: 2026-10-14T12:31:27+05:30
+File Path: `file:///c:/Users/cobra/AndroidStudioProjects/FactShield/app/src/main/java/com/factshield/app/FloatingFaceUI.kt`
+Total Lines: 488
+Total Bytes: 19514
+Showing lines 1 to 50
+The following code has been modified to include a line number before every line, in the format: <line_number>: <original_line>. Please note that any changes targeting the original code should remove the line number, colon, and leading space.
+1: package com.factshield.app
+2: 
+3: import androidx.compose.animation.AnimatedVisibility
+4: import androidx.compose.animation.animateColorAsState
+5: import androidx.compose.animation.core.*
+6: import androidx.compose.animation.fadeIn
+7: import androidx.compose.animation.fadeOut
+8: import androidx.compose.animation.scaleIn
+9: import androidx.compose.animation.scaleOut
+10: import androidx.compose.foundation.Canvas
+11: import androidx.compose.foundation.background
+12: import androidx.compose.foundation.clickable
+13: import androidx.compose.foundation.gestures.detectTapGestures
+14: import androidx.compose.foundation.layout.*
+15: import androidx.compose.foundation.shape.CircleShape
+16: import androidx.compose.foundation.shape.RoundedCornerShape
+17: import androidx.compose.material3.Surface
+18: import androidx.compose.material3.Text
+19: import androidx.compose.runtime.*
+20: import androidx.compose.ui.Alignment
+21: import androidx.compose.ui.Modifier
+22: import androidx.compose.ui.draw.clip
+23: import androidx.compose.ui.draw.shadow
+24: import androidx.compose.ui.geometry.CornerRadius
+25: import androidx.compose.ui.geometry.Offset
+26: import androidx.compose.ui.geometry.Size
+27: import androidx.compose.ui.graphics.*
+28: import androidx.compose.ui.graphics.drawscope.DrawScope
+29: import androidx.compose.ui.graphics.drawscope.Stroke
+30: import androidx.compose.ui.graphics.drawscope.rotate
+31: import androidx.compose.ui.input.pointer.pointerInput
+32: import androidx.compose.ui.text.font.FontWeight
+33: import androidx.compose.ui.text.style.TextOverflow
+34: import androidx.compose.ui.unit.dp
+35: import androidx.compose.ui.unit.sp
+36: import kotlinx.coroutines.delay
+37: 
+38: // ─────────────────────────────────────────────────────────────
+39: //  State enum
+40: // ─────────────────────────────────────────────────────────────
+41: 
+42: enum class BallState { IDLE, SCANNING, GREEN, YELLOW, RED }
+43: 
+44: // ─────────────────────────────────────────────────────────────
+45: //  Color palette
+46: // ─────────────────────────────────────────────────────────────
+47: 
+48: private val ColorIdle    = Color(0xFF1E293B)
+49: private val ColorScanning= Color(0xFF0EA5E9)
+50: private val ColorGreen   = Color(0xFF10B981)
+The above content does NOT show the entire file contents. If you need to view any lines of the file which were not shown to complete your task, call this tool again to view those lines.

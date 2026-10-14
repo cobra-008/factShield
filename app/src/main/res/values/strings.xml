@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">FactShield</string>
+    <string name="accessibility_service_description">FactShield reads visible tweet text and takes screenshots to fact-check content in real time using AI. No personal data is stored.</string>
+</resources>
